@@ -1,0 +1,96 @@
+name: Deploy Cloud Function (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - stg
+          - prod
+      function_name:
+        description: "Function to deploy"
+        required: true
+        default: "create-user"
+        type: choice
+        options:
+          - create-user
+          - update-user
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+    working-directory: ./firebase/function
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ${{ github.event.inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: deploy-cloud-function-${{ github.event.inputs.environment }}
+      cancel-in-progress: false
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@2ddd2b9cb38ad8efd50337e8ab201519a34c9f24 # v7.1.1
+        with:
+          enable-cache: true
+          activate-environment: true
+          working-directory: firebase/function
+
+      - name: Set up Python
+        run: |
+          curl -s https://mise.run | sh
+          uv python install 3.13
+
+      - name: Authenticate GCP
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.ACTIONS_RUNNER_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set environment variables
+        id: set-env
+        run: |
+          if [ "${{ github.event.inputs.environment }}" = "prod" ]; then
+            echo "env_name=production" >> "$GITHUB_OUTPUT"
+            echo "service_account=${{ vars.PROD_FIREBASE_AUTH_FUNCTION_SERVICE_ACCOUNT }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.inputs.environment }}" = "stg" ]; then
+            echo "env_name=staging" >> "$GITHUB_OUTPUT"
+            echo "service_account=${{ vars.STAGING_FIREBASE_AUTH_FUNCTION_SERVICE_ACCOUNT }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "env_name=development" >> "$GITHUB_OUTPUT"
+            echo "service_account=${{ vars.DEV_FIREBASE_AUTH_FUNCTION_SERVICE_ACCOUNT }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set entry point
+        id: set-entry-point
+        run: |
+          if [ "${{ github.event.inputs.function_name }}" = "update-user" ]; then
+            echo "entry_point=update_user" >> "$GITHUB_OUTPUT"
+          else
+            echo "entry_point=create_user" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy Cloud Function
+        run: |
+          gcloud functions deploy ${{ github.event.inputs.function_name }} \
+            --region=asia-northeast1 \
+            --runtime=python313 \
+            --source=functions \
+            --entry-point=${{ steps.set-entry-point.outputs.entry_point }} \
+            --service-account=${{ steps.set-env.outputs.service_account }} \
+            --allow-unauthenticated \
+            --gen2 \
+            --trigger-http
